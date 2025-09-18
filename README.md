@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cafe Scout — Local Cafe Ratings</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-sA+q8g1p3w2mC6w2gY2g8j8bQd7n3m9o5vM0k6w5v6M=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <style>
     :root{
       --bg:#f7f6f0; --card:#ffffff; --accent:#2f6f4e; --muted:#6b6b6b;
@@ -61,47 +61,36 @@
     </div>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-o9N1j8fZbJw1rQYV1kH+nS6tV5w3r3w6rZf+ZkKqP38=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <script>
-    // --- Config ---
     const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
-    const RADIUS = 1200; // meters
-
-    // --- Utilities ---
+    const RADIUS = 1200;
     const el = id => document.getElementById(id);
     const fmtNum = n => (Math.round(n*10)/10).toFixed(1);
 
-    // --- Map setup ---
-    const map = L.map('map', { zoomControl:true }).setView([40.73, -73.93], 13);
+    const map = L.map('map').setView([39.1031, -84.5120], 14); // Default Cincinnati
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
     let markers = L.featureGroup().addTo(map);
 
-    // --- Local storage helpers ---
     function storageKey(osmType, id){ return `cafeRatings:${osmType}:${id}` }
-
     function saveRating(osmType, id, data){
       const key = storageKey(osmType,id);
       const existing = JSON.parse(localStorage.getItem(key) || '[]');
-      // append with timestamp
       existing.push({...data, ts:Date.now()});
       localStorage.setItem(key, JSON.stringify(existing));
     }
-
     function loadRatings(osmType,id){
       const key = storageKey(osmType,id);
       return JSON.parse(localStorage.getItem(key) || '[]');
     }
-
     function clearAllRatings(){
       Object.keys(localStorage).forEach(k=>{ if(k.startsWith('cafeRatings:')) localStorage.removeItem(k)});
       refreshPlacesDisplay(currentPlaces);
       alert('Local ratings cleared.');
     }
-
-    // compute averages from stored votes
     function computeAggregate(osmType,id){
       const arr = loadRatings(osmType,id);
       if(!arr.length) return null;
@@ -112,7 +101,6 @@
       return {count:n, crowd:sums.crowd/n, vibe:sums.vibe/n, clean:sums.clean/n, coffee:sums.coffee/n};
     }
 
-    // --- UI building ---
     const placesList = el('places-list');
     let currentPlaces = [];
 
@@ -141,7 +129,6 @@
         }
         div.appendChild(summary);
 
-        // rating form
         const form = document.createElement('div'); form.style.marginTop='8px';
         ['crowd','vibe','clean','coffee'].forEach(key=>{
           const row = document.createElement('div'); row.className='rating-row';
@@ -162,19 +149,16 @@
         form.appendChild(btn);
         div.appendChild(form);
 
-        // focus on map when clicked
         div.addEventListener('click', ()=> map.setView([p.lat,p.lon],17));
 
         placesList.appendChild(div);
 
-        // add marker
         const m = L.marker([p.lat,p.lon]).addTo(markers).bindPopup(`<strong>${p.tags.name||'Cafe'}</strong><br>${agg?`Avg crowd ${fmtNum(agg.crowd)} (${agg.count})`:'No ratings yet'}`);
       });
       markers.addTo(map);
     }
 
-    // --- Overpass query ---
-    async function fetchCafesNear(lat,lon,queryText){
+    async function fetchCafesNear(lat,lon){
       const q = `[
 out:json][timeout:25];
 node(around:${RADIUS},${lat},${lon})[amenity=cafe];
@@ -183,12 +167,10 @@ out body;`;
         const res = await fetch(OVERPASS_URL, { method:'POST', body:q });
         if(!res.ok) throw new Error('Overpass error');
         const data = await res.json();
-        // data.elements -> nodes
         return data.elements;
       }catch(err){ console.error(err); return [] }
     }
 
-    // --- Geolocation handlers ---
     async function useMyLocation(){
       if(!navigator.geolocation) return alert('Geolocation not supported');
       el('btn-locate').disabled = true; el('btn-locate').textContent='Locating...';
@@ -201,9 +183,7 @@ out body;`;
       }, err=>{ alert('Unable to get location: '+err.message); el('btn-locate').disabled=false; el('btn-locate').textContent='Use my location' });
     }
 
-    // --- Search (geocode optional) ---
     async function searchByText(text){
-      // use Nominatim to geocode the text
       const q = encodeURIComponent(text+' cafe');
       try{
         const res = await fetch(`https://nominatim.openstreetmap.org/search.php?q=${q}&format=jsonv2&limit=1`);
@@ -216,20 +196,16 @@ out body;`;
       }catch(e){ console.error(e); alert('Search failed'); }
     }
 
-    // --- Event listeners ---
     el('btn-locate').addEventListener('click', useMyLocation);
     el('btn-search').addEventListener('click', ()=>{ const q = el('q').value.trim(); if(q) searchByText(q); else alert('Type a place to search (city, neighborhood)') });
     el('btn-clear').addEventListener('click', ()=>{ if(confirm('Clear all local ratings?')) clearAllRatings() });
 
-    // --- Initialize with a demo search around NYC ---
     (async ()=>{
-      // try center on user's IP via a simple request-free guess? We'll just center on Manhattan so app looks alive
-      const demoLat = 40.730610, demoLon = -73.935242;
-      const demo = await fetchCafesNear(demoLat,demoLon);
+      const cincyLat = 39.1031, cincyLon = -84.5120;
+      const demo = await fetchCafesNear(cincyLat,cincyLon);
       refreshPlacesDisplay(demo);
-      map.setView([demoLat,demoLon],13);
+      map.setView([cincyLat,cincyLon],14);
     })();
-
   </script>
 </body>
 </html>
