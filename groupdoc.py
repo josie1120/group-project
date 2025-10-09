@@ -1,15 +1,31 @@
-#print "hello"
+import geocoder
+
 print("hello")
+
+def ask_location():
+    """Prompts user to indicate a city and state they are in."""
+    city = input("Enter the city you are in: ")
+    state = input("Enter the state you are in (abbreviation, e.g., CA for California): ")
+    location = f"{city}, {state}"
+    return location
+
+def get_live_location():
+    """Reports live location while on the app."""
+    g = geocoder.ip('me')
+    if g.ok:
+        return g.city, g.state
+    else:
+        return None, None
+
 def jimmy(key_words, history):
     """
-    Detect negative and inappropriate comments through sentiment analysis. If more than 70% of their comments are negative, the user is flagged for
+    Detect negative and inappropriate comments through sentiment analysis.
+    If more than 70% of comments are negative, the user is flagged.
 
     key_words: A list of words that indicate negative sentiment.
-    history: A list of user comments to analyze
+    history: A list of user comments to analyze.
     
-    returns a flag whether the user history indicates troll or not.
-
-
+    Returns True if user history indicates trolling, otherwise False.
     """
     negative_count = 0
     total_comments = len(history)
@@ -26,6 +42,17 @@ def jimmy(key_words, history):
 
 # Example usage
 if __name__ == "__main__":
+    # Location example
+    user_location = ask_location()
+    print("You entered:", user_location)
+
+    live_city, live_state = get_live_location()
+    if live_city and live_state:
+        print("Live location detected:", live_city, live_state)
+    else:
+        print("Could not detect live location.")
+
+    # Troll detection example
     key_words = ["bad", "hate", "stupid", "useless", "idiot", "worst"]
     user_history = [
         "I hate this product",
