@@ -1,582 +1,75 @@
-# app.py
-
-```python
 import os, time, json
 from flask import Flask, request, jsonify, render_template, session
 import sqlite3, requests
 from werkzeug.security import generate_password_hash, check_password_hash
+
 
 # ----------------------
 # Flask setup
 # ----------------------
 app = Flask(__name__)
 app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY", os.urandom(32)),
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true",
+SECRET_KEY=os.environ.get("SECRET_KEY", os.urandom(32)),
+SESSION_COOKIE_HTTPONLY=True,
+SESSION_COOKIE_SAMESITE="Lax",
+SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true",
 )
+
 
 DB_PATH = os.environ.get("DB_PATH", "cafes.db")
 OVERPASS_URL = os.environ.get("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
 NOMINATIM_URL = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search.php")
 NOMINATIM_UA = os.environ.get("NOMINATIM_UA", "CafeScout/1.0 (contact: you@example.com)")
 
+
 # ----------------------
 # DB helpers
 # ----------------------
 
+
 def db():
-    con = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    con.row_factory = sqlite3.Row
-    return con
+con = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+con.execute("PRAGMA journal_mode=WAL;")
+con.execute("PRAGMA synchronous=NORMAL;")
+con.row_factory = sqlite3.Row
+return con
+
+
 
 
 def init_db():
-    con = db(); cur = con.cursor()
-    # ratings
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ratings(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          osm_type TEXT NOT NULL,
-          osm_id   INTEGER NOT NULL,
-          ts       INTEGER NOT NULL,
-          crowd REAL NOT NULL,
-          vibe  REAL NOT NULL,
-          clean REAL NOT NULL,
-          coffee REAL NOT NULL
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_r ON ratings(osm_type, osm_id)")
-
-    # users
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          email TEXT UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL,
-          display_name TEXT NOT NULL,
-          created_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    # comments
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS comments(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          osm_type TEXT NOT NULL,
-          osm_id   INTEGER NOT NULL,
-          user_id  INTEGER NOT NULL,
-          text     TEXT NOT NULL,
-          ts       INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_cafe ON comments(osm_type, osm_id)")
-
-    con.commit(); con.close()
-
-
-init_db()
-
-# ----------------------
-# Security headers
-# ----------------------
-@app.after_request
-def set_security_headers(resp):
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    return resp
-
-# ----------------------
-# Moderation utility
-# ----------------------
-NEGATIVE_DEFAULT = ["bad","hate","stupid","useless","idiot","worst"]
-
-def is_troll(key_words, history):
-    if not history:
-        return False
-    neg = sum(1 for c in history if any(w in c.lower() for w in key_words))
-    return (neg / len(history)) > 0.7
-
-@app.post("/api/moderate")
-def api_moderate():
-    d = request.get_json(silent=True) or {}
-    return jsonify({
-        "flag": is_troll(d.get("key_words", NEGATIVE_DEFAULT), d.get("history", []))
-    })
-
-# ----------------------
-# Auth helpers & endpoints
-# ----------------------
-
-def current_user():
-    uid = session.get("uid")
-    if not uid:
-        return None
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT id, email, display_name FROM users WHERE id=?", (uid,))
-    row = cur.fetchone(); con.close()
-    if not row:
-        return None
-    return {"id": row[0], "email": row[1], "display_name": row[2]}
-
-
-@app.post("/api/register")
-def register():
-    d = request.get_json(silent=True) or {}
-    email = (d.get("email") or "").strip().lower()
-    pw    = d.get("password") or ""
-    name  = (d.get("display_name") or "").strip() or (email.split("@")[0] if email else "user")
-    if not email or not pw:
-        return jsonify({"error": "email/password required"}), 400
-    con = db(); cur = con.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users(email,password_hash,display_name,created_at) VALUES (?,?,?,?)",
-            (email, generate_password_hash(pw), name, int(time.time()))
-        )
-        con.commit()
-        uid = cur.lastrowid
-    except sqlite3.IntegrityError:
-        con.close(); return jsonify({"error": "email already registered"}), 409
-    con.close()
-    session["uid"] = uid
-    return jsonify({"ok": True, "user": {"email": email, "display_name": name}})
-
-
-@app.post("/api/login")
-def login():
-    d = request.get_json(silent=True) or {}
-    email = (d.get("email") or "").strip().lower()
-    pw    = d.get("password") or ""
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT id,password_hash,display_name FROM users WHERE email=?", (email,))
-    row = cur.fetchone(); con.close()
-    if not row or not check_password_hash(row[1], pw):
-        return jsonify({"error": "invalid credentials"}), 401
-    session["uid"] = row[0]
-    return jsonify({"ok": True, "user": {"email": email, "display_name": row[2]}})
-
-
-@app.post("/api/logout")
-def logout():
-    session.clear()
-    return jsonify({"ok": True})
-
-
-@app.get("/api/me")
-def me():
-    return jsonify({"user": current_user()})
-
-# ----------------------
-# Ratings
-# ----------------------
-
-def _clamp_score(v):
-    try:
-        x = float(v)
-    except Exception:
-        raise ValueError("score not a number")
-    if x < 1: x = 1.0
-    if x > 5: x = 5.0
-    return x
-
-
-@app.post("/api/ratings/<osm_type>/<int:osm_id>")
-def save_rating(osm_type, osm_id):
-    d = request.get_json(silent=True) or {}
-    try:
-        vals = [_clamp_score(d[k]) for k in ("crowd","vibe","clean","coffee")]
-    except Exception:
-        return jsonify({"error": "Invalid rating payload"}), 400
-    with db() as con:
-        con.execute(
-            """INSERT INTO ratings(osm_type,osm_id,ts,crowd,vibe,clean,coffee)
-                   VALUES (?,?,?,?,?,?,?)""",
-            (osm_type, osm_id, int(time.time()*1000), *vals)
-        )
-    return jsonify({"ok": True})
-
-
-@app.get("/api/ratings/<osm_type>/<int:osm_id>/summary")
-def rating_summary(osm_type, osm_id):
-    con = db(); cur = con.cursor()
-    cur.execute(
-        """SELECT COUNT(*), AVG(crowd), AVG(vibe), AVG(clean), AVG(coffee)
-               FROM ratings WHERE osm_type=? AND osm_id=?""",
-        (osm_type, osm_id)
-    )
-    row = cur.fetchone(); con.close()
-    if not row or row[0] == 0:
-        return jsonify({"count": 0})
-    cnt, crowd, vibe, clean, coffee = row
-    return jsonify({
-        "count": int(cnt),
-        "crowd": crowd,
-        "vibe": vibe,
-        "clean": clean,
-        "coffee": coffee,
-    })
-
-
-@app.post("/api/ratings/clear")
-def clear_all_ratings():
-    # Dev-only safety
-    if not app.debug:
-        return jsonify({"error": "disabled in production"}), 403
-    with db() as con:
-        con.execute("DELETE FROM ratings")
-    return jsonify({"ok": True})
-
-# ----------------------
-# Comments
-# ----------------------
-
-def recent_user_comments(uid):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT text FROM comments WHERE user_id=? ORDER BY ts DESC LIMIT 20", (uid,))
-    out = [r[0] for r in cur.fetchall()]
-    con.close()
-    return out
-
-
-@app.get("/api/comments/<osm_type>/<int:osm_id>")
-def list_comments(osm_type, osm_id):
-    con = db(); cur = con.cursor()
-    cur.execute(
-        """
-        SELECT c.id, c.text, c.ts, u.display_name
-        FROM comments c JOIN users u ON c.user_id=u.id
-        WHERE c.osm_type=? AND c.osm_id=?
-        ORDER BY c.ts DESC
-        """,
-        (osm_type, osm_id),
-    )
-    items = [{"id": i, "text": t, "ts": ts, "author": name} for (i, t, ts, name) in cur.fetchall()]
-    con.close()
-    return jsonify(items)
-
-
-@app.post("/api/comments/<osm_type>/<int:osm_id>")
-def add_comment(osm_type, osm_id):
-    u = current_user()
-    if not u:
-        return jsonify({"error": "login required"}), 401
-    d = request.get_json(silent=True) or {}
-    text = (d.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "empty comment"}), 400
-    # moderation using user’s recent history
-    history = [text] + recent_user_comments(u["id"])
-    if is_troll(NEGATIVE_DEFAULT, history):
-        return jsonify({"error": "comment rejected by moderation"}), 403
-    with db() as con:
-        con.execute(
-            """INSERT INTO comments(osm_type,osm_id,user_id,text,ts)
-                   VALUES (?,?,?,?,?)""",
-            (osm_type, osm_id, u["id"], text, int(time.time()*1000))
-        )
-    return jsonify({"ok": True})
-
-# ----------------------
-# External API helpers
-# ----------------------
-
-def _backoff_request(method, url, retries=3, **kw):
-    """Retry on 429/502/503/504 with exponential backoff."""
-    last = None
-    for i in range(retries):
-        r = requests.request(method, url, **kw)
-        if r.status_code not in (429, 502, 503, 504):
-            return r
-        time.sleep(0.5 * (2 ** i))
-        last = r
-    return last if last is not None else r
-
-
-@app.post("/api/nearby")
-def api_nearby():
-    d = request.get_json(silent=True) or {}
-    lat, lon = d.get("lat"), d.get("lon")
-    radius = int(d.get("radius", 1200))
-    if lat is None or lon is None:
-        return jsonify({"error": "lat/lon required"}), 400
-
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node(around:{radius},{lat},{lon})[amenity=cafe];
-      way(around:{radius},{lat},{lon})[amenity=cafe];
-      relation(around:{radius},{lat},{lon})[amenity=cafe];
-    );
-    out center tags;
-    """
-
-    r = _backoff_request(
-        "POST",
-        OVERPASS_URL,
-        data=query,
-        timeout=25,
-        headers={"User-Agent": NOMINATIM_UA},
-    )
-    if not r or not r.ok:
-        return jsonify({"elements": []}), 502
-    return jsonify(r.json())
-
-
-@app.get("/api/search")
-def api_search():
-    q = request.args.get("q")
-    if not q:
-        return jsonify([])
-    params = {"q": f"{q} cafe", "format": "jsonv2", "limit": 1}
-    r = _backoff_request(
-        "GET",
-        NOMINATIM_URL,
-        params=params,
-        headers={"User-Agent": NOMINATIM_UA},
-        timeout=15,
-    )
-    if not r or not r.ok:
-        return jsonify([]), 502
-    return jsonify(r.json())
-
-# ----------------------
-# Frontend
-# ----------------------
-@app.get("/")
-def index():
-    return render_template("index.html")
-
-
-if __name__ == "__main__":
-    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "1") == "1")
-```
-
----
-
-# templates/index.html
-
-```html
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Cafe Scout — Local Cafe Ratings</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
-  <style>
-    :root{ --bg:#f7f6f0; --card:#ffffff; --accent:#2f6f4e; --muted:#6b6b6b;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
-    html,body,#app{height:100%; margin:0; background:var(--bg); color:#222}
-    .container{max-width:1100px; margin:18px auto; display:grid; grid-template-columns:1fr 380px; gap:16px; padding:16px}
-    header{grid-column:1/-1; display:flex; align-items:center; gap:12px}
-    h1{margin:0; font-size:20px}
-    p.lead{margin:0; color:var(--muted); font-size:13px}
-    #map{height:70vh; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,0.08)}
-    .sidebar{background:var(--card); border-radius:10px; padding:12px; height:70vh; overflow:auto; box-shadow:0 6px 20px rgba(12,12,12,0.06)}
-    .search-row{display:flex; gap:8px; margin-bottom:10px}
-    input[type=text]{flex:1; padding:8px 10px; border-radius:8px; border:1px solid #e5e5e5}
-    button{background:var(--accent); color:white; border:none; padding:8px 10px; border-radius:8px; cursor:pointer}
-    .place{padding:8px; border-bottom:1px solid #f0f0f0}
-    .place h3{margin:0 0 4px 0; font-size:16px}
-    .meta{font-size:13px; color:var(--muted)}
-    .rating-row{display:flex; gap:6px; align-items:center; margin-top:8px}
-    .rating-row label{font-size:13px; min-width:70px}
-    .score{width:120px}
-    .btn-small{padding:6px 8px; border-radius:8px; font-size:13px}
-    .rating-summary{margin-top:8px; font-size:13px}
-    .no-results{color:var(--muted); text-align:center; padding:24px}
-    footer{grid-column:1/-1; text-align:center; color:var(--muted); font-size:13px; margin-top:6px}
-    @media(max-width:980px){.container{grid-template-columns:1fr;} .sidebar{height:45vh} #map{height:45vh}}
-  </style>
-</head>
-<body>
-<div id="app">
-  <div class="container">
-    <header>
-      <div style="flex:1">
-        <h1>Cafe Scout</h1>
-        <p class="lead">Find local cafes near you and rate Crowd, Vibe, Cleanliness, Coffee. Ratings are saved on the server.</p>
-      </div>
-      <div style="display:flex;gap:10px;align-items:center">
-        <button id="btn-locate">Use my location</button>
-        <button id="btn-clear" title="Dev only">Clear server ratings (dev)</button>
-      </div>
-    </header>
-
-    <div id="map"></div>
-
-    <aside class="sidebar">
-      <div class="search-row">
-        <input id="q" type="text" placeholder="Search city / neighborhood (optional)" />
-        <button id="btn-search">Search</button>
-      </div>
-      <div id="places-list"><div class="no-results">Click "Use my location" or search to load nearby cafes.</div></div>
-    </aside>
-
-    <footer>Prototype • Flask backend • Overpass &amp; Nominatim for discovery</footer>
-  </div>
-</div>
-
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-<script>
-  const RADIUS = 1200;
-  const el = id => document.getElementById(id);
-  const fmtNum = n => (Math.round(n*10)/10).toFixed(1);
-
-  const map = L.map('map').setView([39.1031, -84.5120], 14); // Cincinnati default
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(map);
-  let markers = L.featureGroup().addTo(map);
-
-  const placesList = el('places-list');
-  let currentPlaces = [];
-
-  async function fetchCafesNear(lat, lon) {
-    const res = await fetch('/api/nearby', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({lat, lon, radius: RADIUS})
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.elements || [];
-  }
-
-  async function searchByText(text){
-    const r = await fetch(`/api/search?q=${encodeURIComponent(text)}`);
-    const arr = await r.json();
-    if(!arr.length){ alert('Place not found'); return; }
-    const lat = parseFloat(arr[0].lat), lon = parseFloat(arr[0].lon);
-    map.setView([lat,lon],14);
-    const places = await fetchCafesNear(lat,lon);
-    refreshPlacesDisplay(places);
-  }
-
-  async function getSummary(osmType, id){
-    const r = await fetch(`/api/ratings/${osmType}/${id}/summary`);
-    if(!r.ok) return {count:0};
-    return r.json();
-  }
-
-  async function saveRating(osmType, id, data){
-    const r = await fetch(`/api/ratings/${osmType}/${id}`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(data)
-    });
-    return r.ok;
-  }
-
-  async function refreshPlacesDisplay(places){
-    currentPlaces = places;
-    markers.clearLayers();
-    if(!places || !places.length){
-      placesList.innerHTML = '<div class="no-results">No cafes found.</div>';
-      return;
-    }
-    placesList.innerHTML = '';
-
-    for (const p of places) {
-      const div = document.createElement('div'); div.className='place';
-      const title = document.createElement('h3'); title.textContent = p.tags?.name || (p.tags?.brand || 'Unnamed Cafe');
-      div.appendChild(title);
-      const meta = document.createElement('div'); meta.className='meta';
-      const city = p.tags?.addr_city || p.tags?.['addr:city'] || '';
-      const street = [p.tags?.['addr:housenumber'], p.tags?.['addr:street']].filter(Boolean).join(' ');
-      meta.textContent = [city, street].filter(Boolean).join(' • ');
-      div.appendChild(meta);
-
-      const agg = await getSummary(p.type, p.id);
-      const summary = document.createElement('div'); summary.className='rating-summary';
-      if(agg.count && agg.count > 0){
-        summary.innerHTML = `Average — Crowd: ${fmtNum(agg.crowd)} · Vibe: ${fmtNum(agg.vibe)} · Clean: ${fmtNum(agg.clean)} · Coffee: ${fmtNum(agg.coffee)} (${agg.count} votes)`;
-      } else {
-        summary.textContent = 'No ratings yet';
-      }
-      div.appendChild(summary);
-
-      const form = document.createElement('div'); form.style.marginTop='8px';
-      ['crowd','vibe','clean','coffee'].forEach(key=>{
-        const row = document.createElement('div'); row.className='rating-row';
-        const label = document.createElement('label'); label.textContent = key.charAt(0).toUpperCase()+key.slice(1)+':';
-        const input = document.createElement('input'); input.type='range'; input.min=1; input.max=5; input.value=4; input.step=1; input.className='score';
-        const val = document.createElement('span'); val.textContent = input.value;
-        input.addEventListener('input', ()=> val.textContent = input.value );
-        row.appendChild(label); row.appendChild(input); row.appendChild(val);
-        form.appendChild(row);
-      });
-      const btn = document.createElement('button'); btn.className='btn-small'; btn.textContent='Save rating';
-      btn.addEventListener('click', async ()=>{
-        btn.disabled = true; btn.textContent = 'Saving…';
-        const inputs = form.querySelectorAll('input[type=range]');
-        const data = {crowd:inputs[0].value, vibe:inputs[1].value, clean:inputs[2].value, coffee:inputs[3].value};
-        const ok = await saveRating(p.type, p.id, data);
-        btn.disabled = false; btn.textContent = 'Save rating';
-        if(!ok){ alert('Save failed'); return; }
-        const updated = await getSummary(p.type, p.id);
-        if(updated.count){
-          summary.innerHTML = `Average — Crowd: ${fmtNum(updated.crowd)} · Vibe: ${fmtNum(updated.vibe)} · Clean: ${fmtNum(updated.clean)} · Coffee: ${fmtNum(updated.coffee)} (${updated.count} votes)`;
-        } else {
-          summary.textContent = 'No ratings yet';
-        }
-      });
-      form.appendChild(btn);
-      div.appendChild(form);
-
-      div.addEventListener('click', ()=> map.setView([p.lat || p.center?.lat, p.lon || p.center?.lon], 17));
-      placesList.appendChild(div);
-
-      const lat = p.lat || p.center?.lat, lon = p.lon || p.center?.lon;
-      if (lat && lon) {
-        L.marker([lat,lon]).addTo(markers)
-          .bindPopup(`<strong>${p.tags?.name || 'Cafe'}</strong><br>${agg.count?`Avg crowd ${fmtNum(agg.crowd)} (${agg.count})`:'No ratings yet'}`);
-      }
-    }
-    markers.addTo(map);
-  }
-
-  async function useMyLocation(){
-    if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
-    el('btn-locate').disabled = true; el('btn-locate').textContent='Locating...';
-    navigator.geolocation.getCurrentPosition(async pos=>{
-      const {latitude:lat, longitude:lon} = pos.coords;
-      map.setView([lat,lon],15);
-      const places = await fetchCafesNear(lat,lon);
-      await refreshPlacesDisplay(places);
-      el('btn-locate').disabled = false; el('btn-locate').textContent='Use my location';
-    }, err=>{
-      alert('Unable to get location: '+err.message);
-      el('btn-locate').disabled=false; el('btn-locate').textContent='Use my location';
-    });
-  }
-
-  el('btn-locate').addEventListener('click', useMyLocation);
-  el('btn-search').addEventListener('click', ()=>{ const q = el('q').value.trim(); if(q) searchByText(q); else alert('Type a place to search (city, neighborhood)') });
-  el('btn-clear').addEventListener('click', async ()=>{
-    if(!confirm('Clear ALL server ratings?')) return;
-    await fetch('/api/ratings/clear', {method:'POST'});
-    if (currentPlaces.length) refreshPlacesDisplay(currentPlaces);
-  });
-
-  (async ()=>{
-    const cincyLat = 39.1031, cincyLon = -84.5120;
-    const demo = await fetchCafesNear(cincyLat, cincyLon);
-    await refreshPlacesDisplay(demo);
-    map.setView([cincyLat, cincyLon], 14);
-  })();
-</script>
-</body>
-</html>
-```
+con = db(); cur = con.cursor()
+# ratings
+cur.execute(
+"""
+CREATE TABLE IF NOT EXISTS ratings(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+osm_type TEXT NOT NULL,
+osm_id INTEGER NOT NULL,
+ts INTEGER NOT NULL,
+crowd REAL NOT NULL,
+vibe REAL NOT NULL,
+clean REAL NOT NULL,
+coffee REAL NOT NULL
+)
+"""
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_r ON ratings(osm_type, osm_id)")
+
+
+# users
+cur.execute(
+"""
+CREATE TABLE IF NOT EXISTS users(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+email TEXT UNIQUE NOT NULL,
+password_hash TEXT NOT NULL,
+display_name TEXT NOT NULL,
+created_at INTEGER NOT NULL
+)
+"""
+)
+
+
+# comments
+app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_DEBUG", "1") == "1")
