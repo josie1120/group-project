@@ -1,0 +1,472 @@
+# app.py
+import os, time, json, sqlite3, requests
+from flask import Flask, request, jsonify, render_template_string
+
+# ----------------------
+# Flask setup
+# ----------------------
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY", os.urandom(32)),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true",
+)
+
+DB_PATH        = os.environ.get("DB_PATH", "cafes.db")
+OVERPASS_URL   = os.environ.get("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+NOMINATIM_URL  = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
+NOMINATIM_UA   = os.environ.get("NOMINATIM_UA", "CafeScout/1.0 (contact: you@example.com)")
+DEFAULT_RADIUS = int(os.environ.get("RADIUS_METERS", "2500"))  # ~1.5 miles
+
+# ----------------------
+# DB helpers
+# ----------------------
+def db():
+    con = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    con = db(); cur = con.cursor()
+    # ratings
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ratings(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        osm_type TEXT NOT NULL,
+        osm_id   INTEGER NOT NULL,
+        ts       INTEGER NOT NULL,
+        crowd    REAL NOT NULL,
+        vibe     REAL NOT NULL,
+        clean    REAL NOT NULL,
+        coffee   REAL NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_r ON ratings(osm_type, osm_id)")
+    # users (placeholder for future auth)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """)
+    con.commit()
+    con.close()
+
+init_db()
+
+# ----------------------
+# External helpers
+# ----------------------
+def overpass_cafes_near(lat: float, lon: float, radius: int = DEFAULT_RADIUS, limit: int = 150):
+    """
+    Query nodes/ways/relations with amenity=cafe around a point. Return raw Overpass JSON.
+    """
+    # nwr = nodes, ways, relations; out center gives lat/lon for ways/relations
+    query = f"""
+    [out:json][timeout:25];
+    (
+      nwr(around:{radius},{lat},{lon})["amenity"="cafe"];
+    );
+    out center {limit};
+    """
+    r = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def nominatim_geocode(text: str, limit: int = 1):
+    headers = {"User-Agent": NOMINATIM_UA}
+    params = {"q": text, "format": "jsonv2", "limit": str(limit)}
+    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+# ----------------------
+# API routes
+# ----------------------
+@app.get("/api/cafes")
+def api_cafes():
+    """
+    GET /api/cafes?lat=..&lon=..&radius=.. (meters)
+    Returns simplified list of places with id/type/tags/center for UI.
+    """
+    try:
+        lat = float(request.args.get("lat", ""))
+        lon = float(request.args.get("lon", ""))
+    except ValueError:
+        return jsonify({"error": "lat and lon are required as numbers"}), 400
+
+    radius = int(request.args.get("radius", DEFAULT_RADIUS))
+    data = overpass_cafes_near(lat, lon, radius)
+    elements = data.get("elements", [])
+    places = []
+    for e in elements:
+        osm_type = e.get("type")  # node/way/relation
+        osm_id   = e.get("id")
+        tags     = e.get("tags", {})
+        # derive center
+        center = None
+        if "lat" in e and "lon" in e:
+            center = {"lat": e["lat"], "lon": e["lon"]}
+        elif "center" in e:
+            center = {"lat": e["center"]["lat"], "lon": e["center"]["lon"]}
+        places.append({
+            "type": osm_type,
+            "id": osm_id,
+            "tags": tags,
+            "center": center
+        })
+    return jsonify({"ok": True, "places": places})
+
+@app.get("/api/geocode")
+def api_geocode():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error":"q is required"}), 400
+    try:
+        res = nominatim_geocode(q, limit=1)
+        if not res:
+            return jsonify({"ok":True, "result":None})
+        item = res[0]
+        return jsonify({
+            "ok": True,
+            "result": {
+                "lat": float(item["lat"]),
+                "lon": float(item["lon"]),
+                "display_name": item.get("display_name")
+            }
+        })
+    except requests.HTTPError as e:
+        return jsonify({"error": str(e)}), 502
+
+@app.post("/api/ratings")
+def api_ratings_post():
+    """
+    JSON: {osm_type, osm_id, crowd, vibe, clean, coffee}
+    """
+    js = request.get_json(force=True, silent=True) or {}
+    try:
+        osm_type = str(js["osm_type"])
+        osm_id   = int(js["osm_id"])
+        crowd    = float(js["crowd"])
+        vibe     = float(js["vibe"])
+        clean    = float(js["clean"])
+        coffee   = float(js["coffee"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "invalid payload"}), 400
+
+    ts = int(time.time())
+    con = db(); cur = con.cursor()
+    cur.execute(
+        "INSERT INTO ratings(osm_type, osm_id, ts, crowd, vibe, clean, coffee) VALUES (?,?,?,?,?,?,?)",
+        (osm_type, osm_id, ts, crowd, vibe, clean, coffee)
+    )
+    con.commit(); con.close()
+    return jsonify({"ok": True})
+
+@app.get("/api/summary")
+def api_summary():
+    """
+    GET /api/summary?osm_type=way&osm_id=123
+    Returns averages and count.
+    """
+    osm_type = request.args.get("osm_type", "")
+    try:
+        osm_id = int(request.args.get("osm_id", ""))
+    except ValueError:
+        return jsonify({"error": "invalid osm_id"}), 400
+
+    con = db(); cur = con.cursor()
+    cur.execute("""
+      SELECT COUNT(*) as cnt,
+             AVG(crowd) as crowd,
+             AVG(vibe)  as vibe,
+             AVG(clean) as clean,
+             AVG(coffee) as coffee
+      FROM ratings WHERE osm_type=? AND osm_id=?
+    """, (osm_type, osm_id))
+    row = cur.fetchone(); con.close()
+    cnt = row["cnt"] or 0
+    if not cnt:
+        return jsonify({"ok": True, "count": 0})
+    return jsonify({
+        "ok": True,
+        "count": int(cnt),
+        "crowd": row["crowd"],
+        "vibe": row["vibe"],
+        "clean": row["clean"],
+        "coffee": row["coffee"],
+    })
+
+@app.post("/api/ratings/clear")
+def api_ratings_clear():
+    """
+    Quick nuke for testing (protect in production).
+    """
+    con = db(); cur = con.cursor()
+    cur.execute("DELETE FROM ratings")
+    con.commit(); con.close()
+    return jsonify({"ok": True, "cleared": True})
+
+# ----------------------
+# Page
+# ----------------------
+PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Cafe Scout — Local Cafe Ratings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+  :root{ --bg:#f7f6f0; --card:#ffffff; --accent:#2f6f4e; --muted:#6b6b6b; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  html,body,#app{height:100%; margin:0; background:var(--bg); color:#222}
+  .container{max-width:1100px; margin:18px auto; display:grid; grid-template-columns:1fr 380px; gap:16px; padding:16px}
+  header{grid-column:1/-1; display:flex; align-items:center; gap:12px}
+  h1{margin:0; font-size:20px}
+  p.lead{margin:0; color:var(--muted); font-size:13px}
+  #map{height:70vh; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,.08)}
+  .side{display:flex; flex-direction:column; gap:12px}
+  .card{background:var(--card); border-radius:12px; padding:12px; box-shadow:0 2px 12px rgba(0,0,0,.06)}
+  .row{display:flex; align-items:center; gap:10px; margin:6px 0}
+  input[type=range]{flex:1}
+  .btn{background:var(--accent); color:#fff; border:none; padding:10px 14px; border-radius:9px; cursor:pointer}
+  .btn-small{background:#eee; border:none; padding:6px 10px; border-radius:8px; cursor:pointer}
+  .place{padding:10px; border:1px solid #eee; border-radius:10px; margin-bottom:10px; background:#fff; cursor:pointer}
+  .muted{color:var(--muted); font-size:12px}
+  .toolbar{display:flex; gap:8px}
+  .toolbar input{flex:1; padding:8px 10px; border-radius:8px; border:1px solid #ddd}
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<div id="app">
+  <div class="container">
+    <header>
+      <h1>Cafe Scout</h1>
+      <p class="lead">Find nearby cafes and share quick 1–5 ratings (Crowd, Vibe, Clean, Coffee).</p>
+    </header>
+
+    <div id="map"></div>
+
+    <div class="side">
+      <div class="card">
+        <div class="toolbar">
+          <input id="q" placeholder="Search a city or neighborhood (e.g., Over-the-Rhine, Prague, NYC)">
+          <button id="btn-search" class="btn">Search</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button id="btn-locate" class="btn">Use my location</button>
+          <button id="btn-clear" class="btn-small" title="Clear all server ratings (demo only)">Clear ratings</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="muted" style="margin-bottom:6px;">Places</div>
+        <div id="places"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const fmtNum = n => (Math.round(n * 10) / 10).toFixed(1);
+
+const map = L.map('map');
+const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+});
+tiles.addTo(map);
+
+let currentPlaces = [];
+
+// ---- API helpers ----
+async function fetchCafesNear(lat, lon, radius=2500){
+  const u = new URL('/api/cafes', location.origin);
+  u.searchParams.set('lat', lat);
+  u.searchParams.set('lon', lon);
+  u.searchParams.set('radius', radius);
+  const r = await fetch(u); if(!r.ok) throw new Error('cafes fetch failed');
+  const js = await r.json();
+  return js.places || [];
+}
+
+async function searchByText(q){
+  const u = new URL('/api/geocode', location.origin);
+  u.searchParams.set('q', q);
+  const r = await fetch(u); if(!r.ok) throw new Error('geocode failed');
+  const js = await r.json();
+  if(!js.ok || !js.result){ alert('Place not found'); return; }
+  const {lat, lon, display_name} = js.result;
+  map.setView([lat, lon], 15);
+  const places = await fetchCafesNear(lat, lon);
+  await refreshPlacesDisplay(places);
+}
+
+async function getSummary(osm_type, osm_id){
+  const u = new URL('/api/summary', location.origin);
+  u.searchParams.set('osm_type', osm_type);
+  u.searchParams.set('osm_id', osm_id);
+  const r = await fetch(u); if(!r.ok) return {count:0};
+  return await r.json();
+}
+
+async function saveRating(osm_type, osm_id, data){
+  const r = await fetch('/api/ratings', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({osm_type, osm_id, ...data})
+  });
+  return r.ok;
+}
+
+// ---- UI rendering ----
+async function refreshPlacesDisplay(places){
+  currentPlaces = places;
+  const placesList = el('places');
+  placesList.innerHTML = '';
+  const markers = L.layerGroup();
+
+  for (const p of places){
+    const div = document.createElement('div'); div.className='place';
+
+    const title = document.createElement('div');
+    title.innerHTML = '<strong>' + (p.tags?.name || 'Cafe') + '</strong>';
+    div.appendChild(title);
+
+    const summary = document.createElement('div'); summary.className='muted';
+    summary.textContent = 'Loading rating…';
+    div.appendChild(summary);
+
+    // load summary
+    (async ()=>{
+      const agg = await getSummary(p.type, p.id);
+      if (agg.count){
+        summary.textContent = `Average — Crowd ${fmtNum(agg.crowd)} · Vibe ${fmtNum(agg.vibe)} · Clean ${fmtNum(agg.clean)} · Coffee ${fmtNum(agg.coffee)} (${agg.count} votes)`;
+      } else {
+        summary.textContent = 'No ratings yet';
+      }
+    })();
+
+    // sliders
+    const form = document.createElement('div');
+    form.style.marginTop = '8px';
+
+    const fields = [
+      ['Crowd','crowd'],
+      ['Vibe','vibe'],
+      ['Clean','clean'],
+      ['Coffee','coffee'],
+    ];
+
+    fields.forEach(([labelText, key])=>{
+      const row = document.createElement('div'); row.className='row';
+      const label = document.createElement('div'); label.style.width='60px'; label.textContent = labelText;
+      const input = document.createElement('input'); input.type='range'; input.min=1; input.max=5; input.value=4; input.step=1; input.className='score';
+      const val = document.createElement('span'); val.textContent = input.value;
+      input.addEventListener('input', ()=> val.textContent = input.value );
+      row.appendChild(label); row.appendChild(input); row.appendChild(val);
+      row.dataset.key = key;
+      form.appendChild(row);
+    });
+
+    const btn = document.createElement('button'); btn.className='btn-small'; btn.textContent='Save rating';
+    btn.addEventListener('click', async ()=>{
+      btn.disabled = true; btn.textContent = 'Saving…';
+      const inputs = form.querySelectorAll('input[type=range]');
+      const data = {
+        crowd: inputs[0].value,
+        vibe: inputs[1].value,
+        clean: inputs[2].value,
+        coffee: inputs[3].value
+      };
+      const ok = await saveRating(p.type, p.id, data);
+      btn.disabled = false; btn.textContent = 'Save rating';
+      if(!ok){ alert('Save failed'); return; }
+      const updated = await getSummary(p.type, p.id);
+      if(updated.count){
+        summary.textContent = `Average — Crowd ${fmtNum(updated.crowd)} · Vibe ${fmtNum(updated.vibe)} · Clean ${fmtNum(updated.clean)} · Coffee ${fmtNum(updated.coffee)} (${updated.count} votes)`;
+      } else {
+        summary.textContent = 'No ratings yet';
+      }
+    });
+    form.appendChild(btn);
+    div.appendChild(form);
+
+    // click pans map
+    div.addEventListener('click', ()=>{
+      const lat = p.center?.lat, lon = p.center?.lon;
+      if (lat && lon) map.setView([lat,lon], 17);
+    });
+    placesList.appendChild(div);
+
+    // marker
+    const lat = p.center?.lat, lon = p.center?.lon;
+    if (lat && lon) {
+      markers.addLayer(
+        L.marker([lat,lon]).bindPopup('<strong>' + (p.tags?.name || 'Cafe') + '</strong>')
+      );
+    }
+  }
+  markers.addTo(map);
+}
+
+// ---- Actions ----
+async function useMyLocation(){
+  if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+  el('btn-locate').disabled = true; el('btn-locate').textContent='Locating...';
+  navigator.geolocation.getCurrentPosition(async pos=>{
+    const {latitude:lat, longitude:lon} = pos.coords;
+    map.setView([lat,lon],15);
+    const places = await fetchCafesNear(lat,lon);
+    await refreshPlacesDisplay(places);
+    el('btn-locate').disabled = false; el('btn-locate').textContent='Use my location';
+  }, err=>{
+    alert('Unable to get location: '+err.message);
+    el('btn-locate').disabled=false; el('btn-locate').textContent='Use my location';
+  });
+}
+
+el('btn-locate').addEventListener('click', useMyLocation);
+el('btn-search').addEventListener('click', ()=>{
+  const q = el('q').value.trim();
+  if(q) searchByText(q); else alert('Type a place to search (city, neighborhood)');
+});
+
+// Demo initial view: Cincinnati, then you can geolocate/search anywhere
+(async ()=>{
+  const cincyLat = 39.1031, cincyLon = -84.5120;
+  map.setView([cincyLat, cincyLon], 14);
+  const demo = await fetchCafesNear(cincyLat, cincyLon);
+  await refreshPlacesDisplay(demo);
+})();
+
+// Danger (demo-only): nuke server ratings
+el('btn-clear').addEventListener('click', async ()=>{
+  if(!confirm('Clear ALL server ratings?')) return;
+  await fetch('/api/ratings/clear', {method:'POST'});
+  if (currentPlaces.length) refreshPlacesDisplay(currentPlaces);
+});
+</script>
+</body>
+</html>
+"""
+
+@app.get("/")
+def home():
+    return render_template_string(PAGE)
+
+# ----------------------
+# Boot
+# ----------------------
+if __name__ == "__main__":
+    app.run(host=os.environ.get("HOST", "127.0.0.1"),
+            port=int(os.environ.get("PORT", 5000)),
+            debug=os.environ.get("FLASK_DEBUG", "1") == "1")
