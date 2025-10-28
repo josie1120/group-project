@@ -1,0 +1,74 @@
+<!doctype html>
+const input = document.createElement('input'); input.type='range'; input.min=1; input.max=5; input.value=4; input.step=1; input.className='score';
+const val = document.createElement('span'); val.textContent = input.value;
+input.addEventListener('input', ()=> val.textContent = input.value );
+row.appendChild(label); row.appendChild(input); row.appendChild(val);
+form.appendChild(row);
+});
+const btn = document.createElement('button'); btn.className='btn-small'; btn.textContent='Save rating';
+btn.addEventListener('click', async ()=>{
+btn.disabled = true; btn.textContent = 'Saving…';
+const inputs = form.querySelectorAll('input[type=range]');
+const data = {crowd:inputs[0].value, vibe:inputs[1].value, clean:inputs[2].value, coffee:inputs[3].value};
+const ok = await saveRating(p.type, p.id, data);
+btn.disabled = false; btn.textContent = 'Save rating';
+if(!ok){ alert('Save failed'); return; }
+const updated = await getSummary(p.type, p.id);
+if(updated.count){
+summary.innerHTML = `Average — Crowd: ${fmtNum(updated.crowd)} · Vibe: ${fmtNum(updated.vibe)} · Clean: ${fmtNum(updated.clean)} · Coffee: ${fmtNum(updated.coffee)} (${updated.count} votes)`;
+} else {
+summary.textContent = 'No ratings yet';
+}
+});
+form.appendChild(btn);
+div.appendChild(form);
+
+
+div.addEventListener('click', ()=> map.setView([p.lat || p.center?.lat, p.lon || p.center?.lon], 17));
+placesList.appendChild(div);
+
+
+const lat = p.lat || p.center?.lat, lon = p.lon || p.center?.lon;
+if (lat && lon) {
+L.marker([lat,lon]).addTo(markers)
+.bindPopup(`<strong>${p.tags?.name || 'Cafe'}</strong><br>${agg.count?`Avg crowd ${fmtNum(agg.crowd)} (${agg.count})`:'No ratings yet'}`);
+}
+}
+markers.addTo(map);
+}
+
+
+async function useMyLocation(){
+if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+el('btn-locate').disabled = true; el('btn-locate').textContent='Locating...';
+navigator.geolocation.getCurrentPosition(async pos=>{
+const {latitude:lat, longitude:lon} = pos.coords;
+map.setView([lat,lon],15);
+const places = await fetchCafesNear(lat,lon);
+await refreshPlacesDisplay(places);
+el('btn-locate').disabled = false; el('btn-locate').textContent='Use my location';
+}, err=>{
+alert('Unable to get location: '+err.message);
+el('btn-locate').disabled=false; el('btn-locate').textContent='Use my location';
+});
+}
+
+
+el('btn-locate').addEventListener('click', useMyLocation);
+el('btn-search').addEventListener('click', ()=>{ const q = el('q').value.trim(); if(q) searchByText(q); else alert('Type a place to search (city, neighborhood)') });
+el('btn-clear').addEventListener('click', async ()=>{
+if(!confirm('Clear ALL server ratings?')) return;
+await fetch('/api/ratings/clear', {method:'POST'});
+if (currentPlaces.length) refreshPlacesDisplay(currentPlaces);
+});
+
+
+(async ()=>{
+const cincyLat = 39.1031, cincyLon = -84.5120;
+const demo = await fetchCafesNear(cincyLat, cincyLon);
+await refreshPlacesDisplay(demo);
+map.setView([cincyLat, cincyLon], 14);
+})();
+</script>
+</body>
+</html>
